@@ -4,7 +4,7 @@ An aircraft autopilot on computercraft for creating aeronautics with autolanding
 
 Добро пожаловать в репозиторий **FMS v15.21** — самой продвинутой, отказоустойчивой и точной системы автоматического пилотирования и наземного радарного слежения для Майнкрафта!
 
-Этот комплекс разработан специально для авиалайнеров из мода **Create Aeronautics** (совместно с **Create**, **ComputerCraft / CC: Tweaked** и **Advanced Peripherals**). 
+Этот комплекс разработан специально для авиалайнеров из мода **Create Aeronautics** (совместно с **Create**, **Create aeronautics** / **CC: Tweaked**) 
 
 ---
 
