@@ -1,0 +1,1152 @@
+-- ============================================
+-- FMS V15.21: FINAL (FIXED LOAD ORDER)
+-- ============================================
+local running = true
+local updateInterval = 0.05
+local altIntegral = 0
+if peripheral.getType("bottom") == "modem" then
+    rednet.open("bottom")
+end
+
+local lastAlt = 0 -- Добавь эту строку в начало файла
+local gimbal, alt_sensor, mon
+local myX, myY, myZ = 0, 0, 0
+local oldX, oldZ = 0, 0
+local curRoll, curPitch, curYaw, curSpd = 0, 0, 0, 0
+local lastYaw = 0
+local actualTrack, smoothTrack = 0, 0
+local selectedIdx = 1
+local targetBrng, headingDiff = 0, 0
+local runways_list = {}
+local invRoll, invPitch, yawOffset = 1, 1, 0
+local swapAxes = false -- Если true, Roll и Pitch меняются местами
+local vel_sensor
+local invSteer = 1 -- Добавь сюда
+local altIntegral = 0
+local pitchTick = 0
+local rollTick = 0
+local speaker
+local approachWarned = false
+local climbPhase = false
+local config = {} -- Добавь это в самое начало файла, если еще нет
+local coordsHistory = {}      -- Таблица для хранения истории координат {time, x, z}
+local lockTargetBrng = nil    -- Переменная для фиксации курса цели
+local isGpsFrozen = false
+local takeoffPhase = false     -- Активен ли взлет
+local takeoffDone = false 
+local routeMode = false        -- Активен ли режим полета по маршруту точек
+local waypoints_list = {}      -- Список загруженных промежуточных точек
+local wpIdx = 1                -- Индекс текущей активной точки маршрута
+local wpPulseTimer = 0         -- Счетчик тиков для удержания редстоун-сигнала без sleep
+local wpActiveRelayObj = nil
+local wpOrbitTimer = 0 -- Счётчик тиков нахождения у одной и той же точки
+local isBreakingOrbit = false -- Флаг экстренного ухода на дальний радиус
+   -- Объект реле, которое сейчас активировано триггером
+
+
+
+
+
+-- НАСТРОЙКИ АВТОПИЛОТА
+local apEnabled = false
+local targetAlt = 120
+local P_STAB, P_NAV, MAX_ROLL = 0.25, 0.5, 25
+
+local configPath = "/navi/relay_config.txt"
+local sides = {"top", "bottom", "left", "right", "front", "back"}
+local relays = {
+  rUp = {dev=nil, side=nil, devName="", sideName="", label="PITCH UP"},
+  rDown = {dev=nil, side=nil, devName="", sideName="", label="PITCH DOWN"},
+  rLeft = {dev=nil, side=nil, devName="", sideName="", label="ROLL LEFT"},
+  rRight = {dev=nil, side=nil, devName="", sideName="", label="ROLL RIGHT"},
+  rEng = {dev=nil, side=nil, devName="", sideName="", label="THROTTLE"},
+  rCustom = {dev=nil, side=nil, devName="", sideName="", label="ACTION RELAY"}
+}
+
+-- ============================================
+-- 1. СЕРВИСНЫЕ ФУНКЦИИ (ОПИСАНИЕ ДО ВЫЗОВА)
+-- ============================================
+
+function findPeripherals()
+    gimbal = peripheral.find("gimbal_sensor")
+    alt_sensor = peripheral.find("altitude_sensor")
+    mon = peripheral.find("monitor")
+    vel_sensor = peripheral.find("velocity_sensor")
+    speaker = peripheral.find("speaker")
+    if mon then
+        mon.setTextScale(0.5)
+    end
+end
+
+function saveConfig()
+    local cfg = {
+        relays = {},
+        invRoll = invRoll,
+        invPitch = invPitch,
+        yawOffset = yawOffset,
+        swapAxes = swapAxes,
+        invSteer = invSteer,
+        passkey = config.passkey or 0,
+        apEnabled = apEnabled,
+        targetAlt = targetAlt,
+        selectedIdx = selectedIdx
+    }
+    for k, v in pairs(relays) do 
+        cfg.relays[k] = {devName=v.devName, sideName=v.sideName} 
+    end
+    local f = fs.open(configPath, "w")
+    f.write(textutils.serialize(cfg))
+    f.close()
+end
+
+
+
+function loadRelayConfig()
+    if not fs.exists(configPath) then 
+        config.passkey = math.random(1000, 9999) 
+        saveConfig()
+        return 
+    end
+    local f = fs.open(configPath, "r")
+    local cfg = textutils.unserialize(f.readAll())
+    f.close()
+    
+    if cfg then
+        -- Загружаем ключ сразу, как только поняли, что файл не пустой
+        config.passkey = cfg.passkey or 0 
+        
+        -- Загружаем реле
+        if cfg.relays then
+            for k, v in pairs(cfg.relays) do
+                relays[k].dev = peripheral.wrap(v.devName)
+                relays[k].side = v.sideName
+                relays[k].devName, relays[k].sideName = v.devName, v.sideName
+            end
+        end
+        -- Загружаем параметры осей
+        invRoll = cfg.invRoll or 1
+        invPitch = cfg.invPitch or 1
+        yawOffset = cfg.yawOffset or 0
+        swapAxes = cfg.swapAxes or false
+        invSteer = cfg.invSteer or 1
+        
+        -- ВОССТАНАВЛИВАЕМ ПОЛЕТНЫЕ ДАННЫЕ:
+        apEnabled = cfg.apEnabled or false
+        targetAlt = cfg.targetAlt or 120
+        selectedIdx = cfg.selectedIdx or 1
+        if apEnabled then
+            if (targetAlt - myY) > 15 then climbPhase = true else climbPhase = false end
+        end
+    end
+end
+
+function loadRunway()
+    local path = "/navi/runways.txt"
+    -- АВТО-СОЗДАНИЕ ФАЙЛА, ЕСЛИ ЕГО НЕТ
+    if not fs.exists(path) then
+        local f = fs.open(path, "w")
+        f.writeLine("0, 0, 100, 100, TEMPLATE, 70") -- Пример строки-шаблона
+        f.close()
+    end
+    runways_list = {}
+    if fs.exists(path) then
+        local f = fs.open(path, "r")
+        local line = f.readLine()
+        while line do
+            local p = {}
+            for part in line:gmatch("([^,]+)") do table.insert(p, (part:gsub("[%s\r\n]", ""))) end
+            if #p >= 5 then
+                table.insert(runways_list, {
+                    x1=tonumber(p[1]) or 0, z1=tonumber(p[2]) or 0,
+                    x2=tonumber(p[3]) or 0, z2=tonumber(p[4]) or 0,
+                    name=p[5] or "UNK",
+                    alt=tonumber(p[6]) or 70 -- ДОБАВЛЕНО: берем 6-й параметр или ставим 70
+                })
+            end
+            line = f.readLine()
+        end
+        f.close()
+    end
+        if #runways_list == 0 then 
+        -- Добавляем x2 и z2, чтобы расчеты (LNAV) не падали из-за nil
+        table.insert(runways_list, {x1=0, z1=0, x2=1, z2=1, name="EMPTY", alt=70}) 
+    end
+
+end
+
+
+function setPwr(rObj, pwr)
+    if rObj and rObj.dev then rObj.dev.setAnalogOutput(rObj.side, math.floor(math.max(0, math.min(15, pwr)))) end
+end
+
+function calibrate()
+    local found = peripheral.getNames()
+    local rList = {}
+    for _, n in ipairs(found) do 
+        if n:find("relay") or n:find("redstone") then table.insert(rList, n) end 
+    end
+    if #rList == 0 then print("No relays found!"); sleep(1) return end
+
+    -- Часть А: Настройка портов
+    local order = {"rUp", "rDown", "rLeft", "rRight", "rEng", "rCustom"}
+    for _, key in ipairs(order) do
+        local dIdx, sIdx, stepDone = 1, 1, false
+        while not stepDone do
+            term.setBackgroundColor(colors.gray); term.clear()
+            term.setCursorPos(2, 2); print("SHAG 1: NASTROIKA RELE - " .. relays[key].label)
+            term.setCursorPos(2, 4); print("Device: " .. (rList[dIdx] or "---"))
+            print(" Side: " .. sides[sIdx])
+            print("\n [SPACE] - TEST | [ENTER] - OK")
+            local _, k = os.pullEvent("key")
+            if k == keys.space then
+                local r = peripheral.wrap(rList[dIdx])
+                if r then r.setAnalogOutput(sides[sIdx], 15) sleep(0.3) r.setAnalogOutput(sides[sIdx], 0) end
+            elseif k == keys.enter then
+                relays[key].dev = peripheral.wrap(rList[dIdx]); relays[key].side = sides[sIdx]
+                relays[key].devName, relays[key].sideName = rList[dIdx], sides[sIdx]
+                stepDone = true
+            elseif k == keys.up then dIdx = dIdx % #rList + 1
+            elseif k == keys.down then dIdx = (dIdx - 2 + #rList) % #rList + 1
+            elseif k == keys.right then sIdx = sIdx % #sides + 1
+            elseif k == keys.left then sIdx = (sIdx - 2 + #sides) % #sides + 1 end
+        end
+    end
+
+        -- Часть Б: Проверка осей (статическая с подтверждением)
+        invRoll, invPitch = 1, 1 -- Сбрасываем перед тестом
+    term.setBackgroundColor(colors.blue); term.clear()
+    term.setCursorPos(2, 2); print("SHAG 2: INVERSIYA")
+        -- Часть Б1: АВТО-ОПРЕДЕЛЕНИЕ SWAP
+    term.setBackgroundColor(colors.blue); term.clear()
+    term.setCursorPos(2, 2); print("SHAG 2: OSI (SWAP)")
+    print("\n NAKLONITE SAMOLET VPRAVO...")
+    
+    local detectDone = false
+    while not detectDone do
+        local a = gimbal.getAngles()
+        local r_raw = a.roll or a[1] or 0
+        local p_raw = a.pitch or a[2] or 0
+        local r = (r_raw > 180 and r_raw - 360 or r_raw)
+        local p = (p_raw > 180 and p_raw - 360 or p_raw)
+
+        -- Если наклонили больше чем на 15 градусов
+        if math.abs(r) > 15 or math.abs(p) > 15 then
+            -- Если по Pitch (p) отклонение больше, значит оси перепутаны
+            swapAxes = (math.abs(p) > math.abs(r))
+            print(swapAxes and " > OSI PEREPUTANY (SWAP ON)" or " > OSI OK")
+            detectDone = true
+            sleep(1.5)
+        end
+        sleep(0.1)
+    end
+
+    -- ДАЛЬШЕ ТВОЙ КОД (Проверка инверсии крена и тангажа...)
+
+    -- Проверка крена
+    print("\n 1. NAKLONITE VPRAVO I NAZHMITE ENTER")
+    local stepDone = false
+    while not stepDone do
+        updateGimbal()
+        term.setCursorPos(2, 5); term.clearLine()
+        write(string.format("Tekushij Roll: %.1f", curRoll))
+        
+        local event, key = os.pullEvent()
+        if event == "key" and key == keys.enter then
+            invRoll = (curRoll < 0) and -1 or 1 -- Инвертируем, если ушло в минус
+            stepDone = true
+        end
+    end
+    print("\n > ROLL ZAFIKSIROVAN")
+    sleep(0.5)
+
+    -- Проверка тангажа
+    print("\n 2. PODNIMITE NOS I NAZHMITE ENTER")
+    stepDone = false
+    while not stepDone do
+        updateGimbal()
+        term.setCursorPos(2, 9); term.clearLine()
+        write(string.format("Tekushij Pitch: %.1f", curPitch))
+        
+        local event, key = os.pullEvent()
+        if event == "key" and key == keys.enter then
+            invPitch = (curPitch < 0) and -1 or 1
+            stepDone = true
+        end
+    end
+    print("\n > PITCH ZAFIKSIROVAN")
+    sleep(1)
+          -- Часть В: ТЕСТ КУРСА (ПРОЕЗД ЧЕРЕЗ VELOCITY)
+    term.setBackgroundColor(colors.black); term.clear()
+    term.setCursorPos(2, 2); print("SHAG 3: KURS (YAW)")
+    print("\n Razgon: 5 m/s v techenie 5 sec...")
+    
+    local startX, startZ = myX, myZ
+    setPwr(relays.rEng, 12) -- Даем газ (12 достаточно для разгона)
+    
+    local okTimer = 0
+    while okTimer < 5 do
+        sleep(1) -- Ждем секунду
+        
+        local speed = 0
+        if vel_sensor then
+            local v = vel_sensor.getVelocity()
+            local raw = (type(v) == "table") and math.sqrt(v.x^2 + v.z^2) or math.abs(v)
+            speed = raw / 5 -- Делим на 10 для синхронизации с Create
+        end
+
+        if speed >= 5 then 
+            okTimer = okTimer + 1 
+        else 
+            okTimer = 0 
+        end
+        
+        term.setCursorPos(2, 6); term.clearLine()
+        write(string.format("Progress: %d/5s | Spd: %.1f", okTimer, speed))
+    end
+    
+        setPwr(relays.rEng, 0) -- Стоп двигатель
+    
+    -- 1. Ждем последнее сообщение GPS, чтобы зафиксировать конечную точку
+        -- Замена строки 246
+    local tID = os.startTimer(1) -- Ждем сигнал 1 секунду
+    while true do
+        local ev, p1, p2, p3 = os.pullEvent()
+        if ev == "rednet_message" and p3 == "AIR_TRAFFIC" then
+            if type(p2) == "table" then myX, myZ = p2.x or myX, p2.z or myZ end
+            break
+        elseif ev == "timer" and p1 == tID then
+            break -- Время вышло, идем дальше
+        end
+    end
+
+    -- 2. Расчет курса и смещения
+    local dx, dz = myX - startX, myZ - startZ
+    local realTrack = math.deg(math.atan2(dx, dz))
+    if realTrack < 0 then realTrack = realTrack + 360 end
+    
+    updateGimbal() 
+    yawOffset = (realTrack - curYaw) % 360
+    
+    print("\n KALIBROVKA OK! OFFSET: " .. math.floor(yawOffset))
+
+    -- 3. ТЕСТ РУЛЕЙ (проверяем инверсию поворота)
+    print("PROVERKA RULEJ...")
+    local startY = curYaw
+    setPwr(relays.rRight, 15)
+    sleep(5.0)
+    setPwr(relays.rRight, 0)
+    updateGimbal()
+    
+    local diff = (curYaw - startY + 180) % 360 - 180
+    if diff < -0.1 then 
+        invSteer = -1
+        print(" > STEER: INVERTED")
+    else
+        invSteer = 1
+        print(" > STEER: OK")
+    end
+
+    -- 4. СОХРАНЕНИЕ И ВЫХОД
+    saveConfig()
+    print("\n VSE DANNYE SOHRANENY!")
+    sleep(2) 
+end -- Конец функции calibrate
+
+
+-- ============================================
+-- 2. ЛОГИКА УПРАВЛЕНИЯ И ТЕЛЕМЕТРИИ
+-- ============================================
+function loadWaypoints()
+    local path = "/navi/route.txt"
+    if not fs.exists(path) then
+        local dir = fs.getDir(path)
+        if not fs.exists(dir) then fs.makeDir(dir) end
+        local f = fs.open(path, "w")
+        f.writeLine("1000, 1000, rCustom, 15") 
+        f.close()
+    end
+    waypoints_list = {}
+    local f = fs.open(path, "r")
+    local line = f.readLine()
+    while line do
+        local p = {}
+        for part in line:gmatch("([^,]+)") do table.insert(p, (part:gsub("[%s\r\n]", ""))) end
+        if #p >= 4 then
+            table.insert(waypoints_list, {
+                x = tonumber(p[1]) or 0,
+                z = tonumber(p[2]) or 0,
+                relay = p[3] or "rCustom",
+                pwr = tonumber(p[4]) or 15
+            })
+        end
+        line = f.readLine()
+    end
+    f.close()
+    wpIdx = 1
+end
+
+
+
+
+function updateGimbal()
+    if not gimbal then return end
+    local a = gimbal.getAngles()
+    if a then
+        local raw1 = a.roll or a[1] or 0
+        local raw2 = a.pitch or a[2] or 0
+        local y_raw = a.yaw or a[3] or 0
+        
+        -- Нормализуем сырые данные
+        local v1 = (raw1 > 180 and raw1 - 360 or raw1)
+        local v2 = (raw2 > 180 and raw2 - 360 or raw2)
+
+        -- САМЫЙ ВАЖНЫЙ МОМЕНТ: Смена осей
+        local r, p
+        if swapAxes then
+            r, p = v2, v1  -- Меняем местами
+        else
+            r, p = v1, v2  -- Как обычно
+        end
+        
+        -- Применяем инверсию и смещение
+        curRoll = r * invRoll
+        curPitch = p * invPitch
+        curYaw = (y_raw + yawOffset) % 360
+    end
+end
+
+
+
+local function setPwr(rObj, pwr)
+    if rObj and rObj.dev then rObj.dev.setAnalogOutput(rObj.side, math.floor(math.max(0, math.min(15, pwr)))) end
+end
+
+function runAutopilot()
+    if not apEnabled then for _, r in pairs(relays) do setPwr(r, 0) end return end
+        -- ==========================================================
+    -- АВТОМАТИЧЕСКИЙ ВЗЛЕТ (TAKEOFF PHASE) - БЕЗ КРЕНА
+    -- ==========================================================
+    if takeoffPhase then
+        local tgt = runways_list[selectedIdx]
+        local portAlt = tgt and tgt.alt or 70
+        
+        if myY > (portAlt + 20) then
+            takeoffPhase = false
+            takeoffDone = true -- Защита: блокируем повтор при посадке
+            climbPhase = true  
+            saveConfig()
+        else
+            setPwr(relays.rEng, 13) -- Полный газ
+            setPwr(relays.rUp, 15)  -- Руль на себя
+            setPwr(relays.rDown, 0)
+            
+            local dRoll = 0 -- КРЕН ЗАПРЕЩЕН, держим крылья ровно
+            local rCorr = (dRoll - curRoll)
+            if math.abs(rCorr) < 4 then
+                setPwr(relays.rRight, 0); setPwr(relays.rLeft, 0)
+            elseif rCorr > 0 then
+                setPwr(relays.rRight, 15); setPwr(relays.rLeft, 0)
+            else
+                setPwr(relays.rRight, 0); setPwr(relays.rLeft, 15)
+            end
+            return -- Выходим, чтобы штатный PID не мешал взлету
+        end
+    end
+    -- ==========================================================
+
+    -- 1. ДАННЫЕ
+    local altErr = targetAlt - myY
+    local verticalSpeed = (myY - lastAlt) / updateInterval
+    lastAlt = myY
+
+       -- ==========================================================
+    -- 2. КРЕН (ДОБАВЛЕН ЗАПРЕТ КРЕНА ПЕРЕД КАСАНИЕМ)
+    -- ==========================================================
+        -- 2. КРЕН (ДОБАВЛЕН ЗАПРЕТ КРЕНА ПЕРЕД КАСАНИЕМ)
+    -- ==========================================================
+        -- ==========================================================
+    -- ИСПРАВЛЕНО: АВИАЦИОННОЕ ПЛАВНОЕ ВЫРАВНИВАНИЕ (ROLL ANTICIPATION)
+    -- ==========================================================
+        -- ==========================================================
+    -- ИСПРАВЛЕНО: АНТИ-ИНЕРЦИОННЫЙ СИЛОВОЙ ТОРМОЗ КРЕНА (ПРОДВИНУТЫЙ D-КОМПОНЕНТ)
+    -- ==========================================================
+       -- ==========================================================
+    -- ИСПРАВЛЕНО: ШИМ-КОНТРОЛЛЕР С УЧЕТОМ ДИНАМИКИ И ИНЕРЦИИ КРЫЛА (ROLL RATE ПИД)
+    -- ==========================================================
+    local activeMaxRoll = (altErr > 40) and 10 or MAX_ROLL
+    if routeMode then activeMaxRoll = 35 end
+
+    -- Базовый целевой крен от навигации
+        -- ==========================================================
+    -- ИСПРАВЛЕНО: СГЛАЖЕННЫЙ ТОРМОЗ ИНЕРЦИИ КРЫЛА (БЕЗ КОЛБАСНИ)
+    -- ==========================================================
+    local targetRollAngle = headingDiff * 2.2 * invSteer * P_NAV
+
+    -- Снизили коэффициент rollRate с 4.5 до 2.2, а turnRate до 1.5. 
+    -- Это уберёт высокочастотную вибрацию, но оставит упреждающее торможение крыла!
+    local dRoll = targetRollAngle - (rollRate * 2.2) - (turnRate * 1.5)
+
+    dRoll = math.max(-activeMaxRoll, math.min(activeMaxRoll, dRoll))
+    
+    local portAlt = runways_list[selectedIdx] and runways_list[selectedIdx].alt or 2
+    if myY <= (portAlt + 20) and not routeMode then dRoll = 0 end
+
+    -- Ошибка между тем, какой крен НУЖЕН с учетом торможения, и какой крен СЕЙЧАС
+    local rCorr = (dRoll - curRoll)
+    local rAbs = math.abs(rCorr)
+    local rollPulseHit = false
+    rollTick = (rollTick + 4) % 4 -- защита от nil тика
+
+    -- АДАПТИВНАЯ ЗОНА ПОКОЯ (DEADZONE) ПОД ДИНАМИКУ СКОРОСТИ
+        -- ==========================================================
+    -- ИСПРАВЛЕНО: РАСШИРЕННЫЙ ФИЛЬТР ПОКОЯ КРЕНА
+    -- ==========================================================
+    local localDeadzone = 5.0
+    -- Когда мы выходим на финишную прямую (headingDiff < 15), увеличиваем 
+    -- зону покоя до 5.0 градусов, чтобы полностью отключать реле при мелкой тряске!
+    if math.abs(headingDiff) > 15 then 
+        localDeadzone = 1.5 
+    end
+
+
+    -- Дозирование импульсов: если скорость вращения крыла огромная, 
+    -- ШИМ включает реле на 100% времени для экстренного торможения!
+        -- ==========================================================
+    -- ИСПРАВЛЕНО: УМНОЕ ИМПУЛЬСНОЕ ДОЗИРОВАНИЕ (МЯГКИЙ ШИМ НА МАРШРУТЕ)
+    -- ==========================================================
+    -- Если мы летим по точкам, искусственно поднимаем порог аварийного зажима реле до 45.0,
+    -- чтобы ШИМ-контроллер продолжал резать сигнал на импульсы и плавно закладывал вираж!
+        -- ==========================================================
+    -- МОДЕРНИЗАЦИЯ: ВЫСОКОСКОРОСТНОЙ ПЛАВНЫЙ ШИМ КРЕНА (КАК НА ТАНГАЖЕ)
+    -- ==========================================================
+    -- Уходим от деления времени на 4 тика. Теперь решение принимается КАЖДЫЙ ТИК!
+    local rollPulseHit = false
+    local emergencyLimit = routeMode and 40.0 or 20.0
+
+    if rAbs > emergencyLimit then
+        -- КРИТИЧЕСКИЙ КРЕН: Зажимаем реле на 100% времени для экстренного выравнивания
+        rollPulseHit = true
+    elseif rAbs > localDeadzone then
+        -- АВТОМАТ СЛЕДЯЩИХ ИМПУЛЬСОВ: Рассчитываем "плотность" заполнения ШИМ.
+        -- Чем сильнее нас отклонило от вектора, тем чаще и дольше будут импульсы,
+        -- но между ними ВСЕГДА будет микро-пауза в 1 тик для разгрузки поршней Create!
+        local currentRollTimer = os.epoch("utc") % 100 -- Быстрый системный таймер в миллисекундах
+        
+        if rAbs > 15.0 then
+            -- Сильное отклонение: Реле замкнуто 75% времени (быстрое и плавное исправление)
+            if currentRollTimer < 75 then rollPulseHit = true end
+        elseif rAbs > 6.0 then
+            -- Среднее отклонение: Реле замкнуто 50% времени (динамичный баланс)
+            if currentRollTimer < 50 then rollPulseHit = true end
+        else
+            -- Микро-коррекция: Короткие тактильные щелчки 25% времени (ювелирное удержание)
+            if currentRollTimer < 25 then rollPulseHit = true end
+        end
+    end
+    -- ==========================================================
+
+    -- ==========================================================
+
+
+    -- Финальный силовой вывод на реле
+    if rAbs < localDeadzone and math.abs(rollRate) < 0.4 then
+        setPwr(relays.rRight, 0); setPwr(relays.rLeft, 0)
+    elseif rollPulseHit then
+        if rCorr > 0 then 
+            setPwr(relays.rRight, 15); setPwr(relays.rLeft, 0)
+        else 
+            setPwr(relays.rRight, 0); setPwr(relays.rLeft, 15) 
+        end
+    else
+        setPwr(relays.rRight, 0); setPwr(relays.rLeft, 0)
+    end
+    -- ==========================================================
+
+
+
+
+
+        -- 3. ТАНГАЖ
+       -- ==========================================================
+    -- 3. ТАНГАЖ (ИСПРАВЛЕНО ДЛЯ ИДЕАЛЬНОГО УДЕРЖАНИЯ ЭШЕЛОНА)
+    -- ==========================================================
+    pitchTick = (pitchTick + 1) % 4
+
+    -- Динамические коэффициенты в зависимости от положения относительно эшелона
+    local pCoeff = (altErr < 0) and 0.15 or 0.30 
+    local vsGain = (altErr < 0) and 3.5 or 2.5
+    local vsComp = verticalSpeed * vsGain
+
+    -- ОЖИВЛЯЕМ ИНТЕГРАЛ: плавно накапливаем ошибку, чтобы компенсировать вес
+    if math.abs(altErr) < 20 then
+        -- dt равен updateInterval (0.05). Коэффициент 0.02 подбирается под вес
+        altIntegral = altIntegral + (altErr * updateInterval * 0.02)
+        -- Ограничиваем влияние интеграла, чтобы избежать раскачки (баффинга)
+        altIntegral = math.max(-5, math.min(5, altIntegral))
+    else
+        altIntegral = 0 -- Обнуляем на больших дистанциях, чтобы избежать заброса
+    end
+
+    -- ИСПРАВЛЕНО: Крен крадет подъемную силу крыла, поэтому нос нужно ЗАДИРАТЬ (+ rollComp)
+    local rollComp = math.abs(curRoll) * 0.35 
+
+        -- Считаем целевой тангаж (dPitch)
+    local dPitch = (altErr * pCoeff) + rollComp - vsComp + altIntegral
+
+    -- ИСПРАВЛЕНО: Если летим по точкам, режем лимиты до [-6; 6], убирая качание носа
+    if routeMode then
+        if dPitch < -6 then dPitch = -6 end 
+        if dPitch > 6 then dPitch = 6 end 
+    else
+        -- Ваши обычные лимиты для захода на посадку
+        if dPitch < -15 then dPitch = -15 end 
+        if dPitch > 12 then dPitch = 12 end 
+    end
+
+    local pCorr = (dPitch - curPitch)
+    local pAbs = math.abs(pCorr)
+    local pulseHit = false
+
+    -- Логика рывков реле (гашение автоколебаний)
+    if pAbs > 10 then
+        pulseHit = true 
+    elseif pAbs > 2.5 then
+        if pCorr < 0 then
+            -- СПУСК: более редкие импульсы, чтобы не разгонять пике
+            if pitchTick == 0 then pulseHit = true end 
+        else
+            -- НАБОР: более частые импульсы для преодоления гравитации
+            if pitchTick == 0 or pitchTick == 2 then pulseHit = true end
+        end
+    elseif pAbs > 0.4 then
+        -- Микро-коррекция удержания горизонта
+        if pitchTick == 0 then pulseHit = true end
+    end
+
+
+
+    -- 4. ВЫХОД НА РЕЛЕ
+    if math.abs(altErr) < 0.5 and math.abs(verticalSpeed) < 0.2 then
+        setPwr(relays.rUp, 0); setPwr(relays.rDown, 0)
+    elseif pulseHit then
+        if pCorr > 0 then 
+            setPwr(relays.rUp, 15); setPwr(relays.rDown, 0)
+        else 
+            setPwr(relays.rUp, 0); setPwr(relays.rDown, 15) 
+        end
+    else
+        setPwr(relays.rUp, 0); setPwr(relays.rDown, 0)
+    end
+end
+
+    
+
+function drawCockpit(w, h)
+    term.setBackgroundColor(colors.black); term.clear()
+    local cx = math.floor(w / 2)
+    local tgt = runways_list[selectedIdx]
+    term.setTextColor(colors.yellow); term.setCursorPos(1, 1)
+     write(string.format("R:%-2.0f P:%-2.0f Y:%03d ALT:%d -> %d SPD:%-3.1f", curRoll, curPitch, curYaw, myY, targetAlt, curSpd))
+    term.setCursorPos(w-10, 1); term.setTextColor(apEnabled and colors.green or colors.red)
+    write(apEnabled and "AP:ACTIVE" or "AP:READY")
+    term.setCursorPos(cx-10, 2); term.setTextColor(colors.gray); write("[  .  N  .  E  .  S  .  W  ]")
+    local trackOff = (smoothTrack - curYaw + 180) % 360 - 180
+    local targetPos = math.max(-10, math.min(10, math.floor((trackOff + headingDiff) / 10 + 0.5)))
+    term.setCursorPos(cx + targetPos, 3); term.setTextColor(colors.magenta); write("T")
+    local vx = math.max(-10, math.min(10, math.floor(trackOff / 10 + 0.5)))
+    term.setCursorPos(cx + vx, 3); term.setTextColor(colors.green); write("v")
+    term.setCursorPos(cx, 3); term.setTextColor(colors.white); write("^")
+    local horizonY = 6; local rad = math.rad(curRoll); term.setTextColor(colors.blue)
+    for dx = -8, 8 do
+        local dy = math.floor(dx * math.tan(rad) - (curPitch * 0.1) + 0.5)
+        if horizonY+dy > 4 and horizonY+dy < 9 then term.setCursorPos(cx+dx, horizonY+dy); write("=") end
+    end
+    term.setCursorPos(cx-1, horizonY); term.setTextColor(colors.white); write(">o<")
+    -- Находим последние строки функции drawCockpit
+       -- Находим последние строки функции drawCockpit
+    term.setCursorPos(1, h)
+    term.setTextColor(colors.magenta)
+    
+    -- ==========================================================
+    -- ИСПРАВЛЕНО: ДИНАМИЧЕСКИЙ ВЫВОД ИНФОРМАЦИИ WP / RUNWAY
+    -- ==========================================================
+    local displayStr = ""
+    local dist = 0
+
+    if routeMode and #waypoints_list > 0 then
+        -- Если летим по точкам (кнопка T)
+        local wp = waypoints_list[wpIdx]
+        if wp then
+            dist = math.sqrt((wp.x - myX)^2 + (wp.z - myZ)^2)
+            -- Форматируем строку вида "WP 1/5" (не длиннее 11 символов)
+            displayStr = string.format("WP %d/%d", wpIdx, #waypoints_list)
+        else
+            displayStr = "WP NONE"
+        end
+    else
+        -- Стандартный режим полета в аэропорт (кнопка A)
+        if tgt then
+            dist = math.sqrt((tgt.x1 - myX)^2 + (tgt.z1 - myZ)^2)
+        end
+        displayStr = (tgt and tgt.name or "NONE"):sub(1, 11)
+    end
+    
+    -- Выводим собранные данные в левый угол нижней строки
+    write(string.format("%-11s D:%-5d", displayStr, dist))
+    -- ==========================================================
+
+
+    -- 3. Выводим координаты GPS (смещаем чуть правее)
+    local gpsStr = string.format("G:%d,%d", myX, myZ)
+    term.setCursorPos(w - #gpsStr + 1, h) 
+    term.setTextColor(colors.cyan)
+    write(gpsStr)
+end
+
+-- ============================================
+-- 3. СТАРТ ПРОГРАММЫ (ТЕПЕРЬ ВСЁ ЗАГРУЖЕНО)
+-- ============================================
+
+findPeripherals()
+loadRunway()
+loadRelayConfig()
+
+updateGimbal()
+oldX, oldZ = myX, myZ 
+lastAlt = alt_sensor and alt_sensor.getHeight() or 0
+
+local cruiseAlt = targetAlt 
+local displayTick = 0 -- Делитель для экрана
+
+local myTimer = os.startTimer(updateInterval)
+
+while running do
+    local event, p1, p2, p3 = os.pullEvent()
+    
+    -- Вся физика полета работает СТРОГО по сигналу полетного таймера
+    if event == "timer" and p1 == myTimer then
+        updateGimbal()
+        
+        -- ==========================================================
+        -- ГЛОБАЛЬНАЯ ЗАЩИТА ОТ ЗАЛИПАНИЯ ПОРТОВ (ВНЕ СИСТЕМЫ РЕЖИМОВ)
+        -- Гарантированно гасит любое реле через 0.5 сек в любом режиме!
+        -- ==========================================================
+        if wpPulseTimer > 0 then
+            wpPulseTimer = wpPulseTimer - 1
+            if wpPulseTimer == 0 and wpActiveRelayObj then
+                setPwr(wpActiveRelayObj, 0) 
+                wpActiveRelayObj = nil
+            end
+        end
+        -- ==========================================================
+        
+        -- 1. СКОРОСТЬ
+        if vel_sensor then
+            local v = vel_sensor.getVelocity()
+            local rawSpd = 0
+            if type(v) == "table" then
+                rawSpd = math.sqrt((v.x or 0)^2 + (v.z or 0)^2)
+            else
+                rawSpd = math.abs(v or 0)
+            end
+            curSpd = rawSpd 
+        end
+
+        -- 2. ВЫСОТА И ТРЕК
+        if alt_sensor then myY = alt_sensor.getHeight() or 0 end
+        
+        local dx, dz = myX - oldX, myZ - oldZ
+        if (math.abs(dx) > 0.1 or math.abs(dz) > 0.1) then
+            actualTrack = math.deg(math.atan2(dx, dz))
+            if actualTrack < 0 then actualTrack = actualTrack + 360 end
+            oldX, oldZ = myX, myZ
+        end
+        local tDiff = (actualTrack - smoothTrack + 180) % 360 - 180
+        smoothTrack = (smoothTrack + tDiff * 0.2) % 360
+
+        -- ==========================================================
+        -- ИСПРАВЛЕНО: ГЛОБАЛЬНЫЙ РАСЧЕТ СКОРОСТИ ВРАЩЕНИЯ ДЛЯ УПРЕЖДЕНИЯ
+        -- Теперь навигация законно видит turnRate до вызова runAutopilot!
+        -- ==========================================================
+        turnRate = (curYaw - lastYaw + 180) % 360 - 180
+        lastYaw = curYaw
+        -- Считаем, на сколько градусов изменился крен за 1 тик (динамика крыла)
+        if not lastRoll then lastRoll = curRoll end
+        rollRate = curRoll - lastRoll
+        lastRoll = curRoll
+        -- 3. НАВИГАЦИЯ И ГЛИССАДА
+        local tgt = runways_list[selectedIdx]
+        
+        -- ==========================================================
+        -- АВТОНОМНЫЙ РЕЖИМ МАРШРУТНЫХ ТОЧЕК (ПРОЦЕДУРНАЯ ПЕТЛЯ ЗАХОДА)
+        -- ==========================================================
+        if apEnabled and routeMode and #waypoints_list > 0 then
+            local wp = waypoints_list[wpIdx]
+            if wp then
+                local distToWp = math.sqrt((wp.x - myX)^2 + (wp.z - myZ)^2)
+                
+                -- Вычисляем базовое направление на саму точку
+                local tdx = wp.x - myX
+                local tdz = wp.z - myZ
+                local rawBrng = math.deg(math.atan2(tdx, tdz))
+                if rawBrng < 0 then rawBrng = rawBrng + 360 end
+
+                -- ==========================================================
+                -- МАТЕМАТИКА ВЕКТОРНОГО ЗАХВАТА ЛИНЕЙНОГО ПУТИ (ЛЗП)
+                -- ==========================================================
+                -- Строим вектор захода. Если это первая точка, вектор идет от текущего курса.
+                -- Если точки меняются, вектор строится как прямая линия к цели.
+                if not lastWpBrng then lastWpBrng = rawBrng end
+                
+                local radTrack = math.rad(smoothTrack)
+                local tx = math.sin(radTrack)
+                local tz = math.cos(radTrack)
+                
+                -- Расчет бокового отклонения от воображаемой стрелы вектора в блоках
+                local acrossWp = tdx * tz - tdz * tx
+                local dotProduct = tdx * tx + tdz * tz
+
+                -- Динамический угол перехвата вектора (Interceptor Angle)
+                -- Чем дальше мы боком от стрелы, тем агрессивнее доворачиваем (макс на 45 градусов)
+                local interceptAngle = math.max(-45, math.min(45, acrossWp * 0.8))
+
+                -- Магическая формула: целевой курс складывается из направления вектора и угла притирки к нему!
+                if dotProduct > 0 then
+                    -- Мы идем к точке: плавно «наплываем» на осевую линию издалека
+                    targetBrng = (rawBrng + interceptAngle) % 360
+                else
+                    -- Мы пролетели точку: закладываем размашистый разворот обратного трека
+                    targetBrng = (smoothTrack + 65) % 360
+                end
+                -- ==========================================================
+
+                -- АВТОМАТ ОРБИТАЛЬНОГО ЗАМКА
+                if distToWp < 150 then wpOrbitTimer = wpOrbitTimer + 1
+                else wpOrbitTimer = math.max(0, wpOrbitTimer - 1) end
+                if wpOrbitTimer > 240 then isBreakingOrbit = true end
+                if isBreakingOrbit and distToWp > 500 then isBreakingOrbit = false; wpOrbitTimer = 0 end
+                if isBreakingOrbit then targetBrng = (rawBrng + 180) % 360 end
+
+                -- БАЛЛИСТИЧЕСКИЙ ВЫЧИСЛИТЕЛЬ СБРОСА (Остается без изменений)
+                local targetGroundAlt = wp.y or portAlt or 2
+                local relativeDropHeight = math.max(0, myY - targetGroundAlt)
+                local fallTimeInSeconds = math.sqrt((2 * relativeDropHeight) / 18.5)
+                local safeSpd = math.max(1, curSpd)
+                local idealLeadDist = safeSpd * fallTimeInSeconds
+                local currentCorr = (uav and uav.ballisticsCorrection) or 1.08
+                local ballisticsLeadDist = idealLeadDist * currentCorr
+
+                -- Снайперский триггер сброса: строго на осевой линии вектора при совпадении дистанции упреждения!
+                local isAimed = (math.abs(acrossWp) < 8) -- Зажали допуск сноса до 8 блоков для ювелирной точности
+                if isAimed and distToWp <= ballisticsLeadDist and wpPulseTimer == 0 and dotProduct > 0 then
+                    local rObj = relays[wp.relay] or relays.rCustom
+                    if rObj then
+                        setPwr(rObj, wp.pwr or 15)
+                        wpActiveRelayObj = rObj
+                        wpPulseTimer = 10
+                    end
+                    
+                    -- Смена точки и сохранение азимута для следующего вектора
+                    lastWpBrng = rawBrng
+                    wpIdx = wpIdx + 1
+                    if wpIdx > #waypoints_list then
+                        routeMode = false; takeoffDone = true; climbPhase = false
+                        if tgt then targetAlt = cruiseAlt end
+                    end
+                end
+                
+                -- НАВИГАЦИОННОЕ УПРЕЖДЕНИЕ И ВЫВОД ИЗ ШРЕДИНГЕРА
+                local predictedTrack = (smoothTrack + (turnRate * 25.0)) % 360
+                local rawDiff = (targetBrng - predictedTrack + 180) % 360 - 180
+                if math.abs(math.abs(rawDiff) - 180) < 1.5 then headingDiff = 25
+                else headingDiff = rawDiff end
+                
+                -- ==========================================================
+                -- ФИКС: ЗАПИТКА МОТОРА И ВЫСОТЫ НА МАРШРУТЕ
+                -- ==========================================================
+                targetAlt = cruiseAlt or 300
+                climbPhase = false 
+                if apEnabled then
+                    setPwr(relays.rEng, 13) -- Врубаем мотор Create на крейсерский ход
+                else
+                    setPwr(relays.rEng, 0)
+                end
+                -- ==========================================================
+                
+                goto skip_runway_logic
+
+            end
+
+        end
+        -- ==========================================================
+
+        -- ==========================================================
+        -- СТАНДАРТНАЯ ПОСАДОЧНАЯ НАВИГАЦИЯ НА АЭРОДРОМ (ПЕРЕНЕСЕНА ЛОГИКА С Т)
+        -- ==========================================================
+                -- ==========================================================
+        -- СТАНДАРТНАЯ ПОСАДОЧНАЯ НАВИГАЦИЯ (РАСЧЕТ ГЛИССАДЫ В ЦЕНТР ВПП)
+        -- ==========================================================
+        if tgt then
+            local rdx, rdz = tgt.x2 - tgt.x1, tgt.z2 - tgt.z1
+            local rLen = math.sqrt(rdx*rdx + rdz*rdz)
+            if rLen == 0 then rLen = 1 end 
+            local ux, uz = rdx/rLen, rdz/rLen 
+            
+            -- Вычисляем координаты точной СЕРЕДИНЫ полосы для идеального приземления
+            local centerX = tgt.x1 + ux * (rLen / 2)
+            local centerZ = tgt.z1 + uz * (rLen / 2)
+            
+            -- Все расстояния считаются строго до СЕРЕДИНЫ бетона
+            local px, pz = myX - centerX, myZ - centerZ
+            local distAlong = px * ux + pz * uz
+            local distAcross = px * uz - pz * ux 
+            local dist = math.sqrt(px*px + pz*pz) or 0
+
+            -- Рассчитываем истинный курс самого полотна ВПП
+            local runwayBrng = math.deg(math.atan2(rdx, rdz))
+            if runwayBrng < 0 then runwayBrng = runwayBrng + 360 end
+
+            -- ==========================================================
+            -- 1. КУРСОВАЯ НАВИГАЦИЯ: КЛАССИЧЕСКОЕ "ЗОЛОТОЕ СЕЧЕНИЕ"
+            -- ==========================================================
+            if distAlong <= 0 then
+                -- Мы уже перелетели середину полосы: ложимся на курс ВПП с боковой коррекцией
+                targetBrng = runwayBrng
+                local runwayCorrection = math.max(-5, math.min(5, distAcross * 0.2))
+                targetBrng = (targetBrng + runwayCorrection) % 360
+            else
+                -- АДАПТИВНОЕ "ЗОЛОТОЕ СЕЧЕНИЕ" С ЦЕЛЬЮ В ЦЕНТР ПОЛОСЫ
+                local baseLookAhead = 400
+                if math.abs(distAcross) > 200 or distAlong < 0 then
+                    baseLookAhead = 800 
+                end
+
+                -- Ограничиваем упреждение lookAhead сверху (макс 1000 блоков),
+                -- чтобы на дистанции 3200+ блоков углы не уходили в бесконечный тупик!
+                local lookAhead = math.max(baseLookAhead, math.min(1000, math.abs(distAlong) * 0.7))
+                local targetDist = distAlong + lookAhead
+                if targetDist > 0 then targetDist = 0 end 
+
+                -- Строим траекторию выравнивания строго к центральной точке
+                local finalTgtX = centerX + ux * targetDist
+                local finalTgtZ = centerZ + uz * targetDist
+
+                local fdx = finalTgtX - myX
+                local fdz = finalTgtZ - myZ
+                targetBrng = math.deg(math.atan2(fdx, fdz))
+                if targetBrng < 0 then targetBrng = targetBrng + 360 end
+                
+                local sideCorrection = math.atan2(distAcross * 1.2, lookAhead)
+                targetBrng = (targetBrng + math.deg(sideCorrection)) % 360
+            end
+
+            -- Вывод из состояния Кота Шрёдингера (разворот из мертвой зоны 180 градусов)
+            local predictedTrack = (smoothTrack + (turnRate * 25.0)) % 360
+            local rawDiff = (targetBrng - predictedTrack + 180) % 360 - 180
+            if math.abs(rawDiff) >= 170 and math.abs(rawDiff) <= 190 then
+                headingDiff = 25
+            else
+                headingDiff = rawDiff
+            end
+            
+            -- Принудительно гасим флаг ухода на круг для корректной работы автомата тяги
+            _G.forceGoAroundGas = false
+
+            -- ==========================================================
+            -- 2. ВЫСОТНАЯ НАВИГАЦИЯ: РАСЧЕТ ИСТИННОЙ ГЛИССАДЫ (VNAV)
+            -- ==========================================================
+            local safeDistAlong = distAlong or 0
+            local portAlt = (tgt and tgt.alt) or 2
+
+            if not startLandingGlide then
+                -- Вдали от зоны захода намертво удерживаем маршевый эшелон круиза
+                targetAlt = cruiseAlt
+            else
+                -- Начинаем плавное и ранее снижение эшелона к середине полосы
+                local safeDist = math.max(10, safeDistAlong + 20)
+                local safeSpeed = math.max(2, curSpd) 
+                local timeToTarget = safeDist / safeSpeed
+                local heightToLose = myY - portAlt
+                local targetVsPerTick = (heightToLose / timeToTarget) * updateInterval
+
+                local maxVsPerTick = 0.5 * updateInterval 
+                if targetVsPerTick > maxVsPerTick then targetVsPerTick = maxVsPerTick end
+                local glideTarget = myY - targetVsPerTick
+
+                if glideTarget < cruiseAlt then 
+                    targetAlt = glideTarget 
+                else
+                    targetAlt = cruiseAlt
+                end
+
+                -- ФИКС: ЖЕСТКИЙ ПРИЖИМ К ПОЛОСЕ (ФИНАЛЬНОЕ СНИЖЕНИЕ)
+                -- Если мы подошли в упор к полосе (меньше 150 блоков по оси) 
+                -- и боковой снос минимальный — отменяем формулы, требуем высоту бетона!
+                local isStrictOnRunwayHeading = (distAcross ~= nil and math.abs(distAcross) < 40)
+                if safeDistAlong <= 150 and isStrictOnRunwayHeading then
+                    targetAlt = portAlt
+                end
+            end
+
+            -- ==========================================================
+            -- 3. СКОРОСТНАЯ НАВИГАЦИЯ: СНАЙПЕРСКИЙ АВТОМАТ ТЯГИ ДВИГАТЕЛЯ
+            -- ==========================================================
+            local engineSignal = 13 -- По умолчанию даем полный марш, чтобы БПЛА летел к базе!
+            local relativeAlt = math.max(0, myY - portAlt)
+
+            if tgt and tgt.name ~= "EMPTY" then
+                climbPhase = false 
+                
+                if takeoffPhase or _G.forceGoAroundGas then
+                    engineSignal = 13 
+                else
+                    -- ШТАТНЫЙ ЗАХОД: Включается только когда мы летим по правильной траектории
+                    local isStrictOnRunwayHeading = (distAcross ~= nil and math.abs(distAcross) < 40)
+
+                    if not startLandingGlide or not isStrictOnRunwayHeading then
+                        -- Держим полный марш вдали от зоны глиссады или при боковом перехвате
+                        engineSignal = 13 
+                    else
+                        -- Мягкая глиссада: плавно снижаем обороты только при идеальном створе полосы
+                        local smoothGas = 8.5 + (safeDistAlong / 1200) + (relativeAlt / 150)
+                        engineSignal = math.floor(math.max(6, math.min(13, smoothGas)) + 0.5)
+                    end
+                    
+                    -- УМНЫЙ ЗАМОК КАСАНИЯ: Переводим мотор на малый газ (4)
+                    -- ТОЛЬКО если мы физически находимся НАД полосой И высота меньше 1.5 блоков!
+                    if safeDistAlong > -50 and safeDistAlong <= 80 and relativeAlt <= 1.5 then
+                        engineSignal = 4
+                    end
+
+                    -- ПОЛНЫЙ ОСТАНОВ: Глушим винты Create в ноль при честной пробежке
+                    if safeDistAlong < -150 and relativeAlt <= 2.0 then
+                        engineSignal = 0
+                    end
+                end
+                
+                -- Сохраняем значение в глобальную шину данных
+                _G.engineSignal = engineSignal
+            end
+
+            -- ==========================================================
+            -- 4. ТАКТИЛЬНЫЙ ДАТЧИК КАСАНИЯ ЗЕМЛИ И ОТКЛЮЧЕНИЕ СИСТЕМ
+            -- ==========================================================
+            local currentVsPerTick = (myY - (lastAlt or myY))
+            local inRunwayZone = (safeDistAlong <= (rLen / 2) and safeDistAlong > -(rLen / 2))
+            local isAtLandingAlt = (myY <= (portAlt + 35.0))
+            local isNotFalling = (math.abs(currentVsPerTick) < 0.05)
+            local isOnGround = inRunwayZone and isAtLandingAlt and isNotFalling and not takeoffPhase
+
+            if apEnabled and isOnGround and (dist < 80) then
+                apEnabled = false 
+                engineSignal = 0  
+                saveConfig()      
+                for _, r in pairs(relays) do setPwr(r, 0) end
+            end
+
+            -- Финальная подача питания на реле мотора Create
+            if apEnabled then
+                setPwr(relays.rEng, _G.engineSignal or engineSignal or 13)
+            else
+                setPwr(relays.rEng, 0) 
+            end
+
+        end -- Этот системный end наглухо запечатывает весь блок: if tgt then
+
+    -- ==========================================================
+    -- ПОЛЕТНАЯ МЕТКА ОБХОДА (СЮДА БЕЗБОЛЕЗНЕННО ПРЫГАЕТ РЕЖИМ Т)
+    -- ==========================================================
+    ::skip_runway_logic::
+
+
+        -- Вызов исполнительной геометрии автопилота
+        runAutopilot()
+        
+        -- Отрисовка экрана (раз в 2 тика для разгрузки процессора)
+        displayTick = (displayTick + 1) % 2
+        if displayTick == 0 then
+            if mon and peripheral.isPresent(peripheral.getName(mon)) then
+                local mW, mH = mon.getSize()
+                if mW and mH then
+                    local oldTerm = term.redirect(mon)
+                    drawCockpit(mW, mH)
+                    term.redirect(oldTerm)
+                end
+            end
+            local tW, tH = term.getSize()
+            if tW and tH then drawCockpit(tW, tH) end
+        end
+
+        -- Перезапускаем полетный таймер физики
+        myTimer = os.startTimer(updateInterval)
+
+    -- =========================================================================
+    -- СЕТЕВОЙ МОСТ: ПРИЕМ КОМАНД И КООРДИНАТ С ПЛАНШЕТА ПО REDNET
+    -- =========================================================================
+    elseif event == "rednet_message" and p3 == "AIR_TRAFFIC" then
+        if type(p2) == "table" and p2.key == config.passkey then
+            myX, myZ = p2.x or myX, p2.z or myZ
+        end
+
+    -- =========================================================================
+    -- ОБРАБОТЧИК ФИЗИЧЕСКИХ КЛАВИШ КОКПИТА САМОЛЕТА
+    -- =========================================================================
+    elseif event == "key" then
+        if p1 == keys.q then 
+            running = false
+        elseif p1 == keys.a then
+            routeMode = false 
+            apEnabled = not apEnabled
+            if apEnabled then
+                local tgt = runways_list[selectedIdx]
+                local portAlt = tgt and tgt.alt or -50
+                if myY <= (portAlt + 20) and not takeoffDone then
+                    takeoffPhase = true
+                    cruiseAlt = 300 
+                    targetAlt = 300
+                else
+                    if (targetAlt - myY) > 15 then climbPhase = true else climbPhase = false end
+                end
+            else
+                takeoffPhase = false
+            end
+            saveConfig()
+
+        elseif p1 == keys.t then
+            loadWaypoints() 
+            if #waypoints_list > 0 then
+                routeMode = true
+                apEnabled = true       
+                takeoffPhase = false   
+                climbPhase = false     
+                os.queueEvent("timer", myTimer) 
+            else
+                routeMode = false
+                apEnabled = false
+            end
+            saveConfig()
+
+        elseif p1 == keys.s then 
+            calibrate()
+            cruiseAlt = targetAlt
+        elseif p1 == keys.pageUp then 
+            cruiseAlt = cruiseAlt + 10
+            targetAlt = cruiseAlt
+            saveConfig()
+        elseif p1 == keys.pageDown then 
+            cruiseAlt = cruiseAlt - 10
+            targetAlt = cruiseAlt
+            saveConfig()
+        elseif p1 == keys.up then 
+            selectedIdx = selectedIdx % #runways_list + 1
+            saveConfig()
+        elseif p1 == keys.down then 
+            selectedIdx = (selectedIdx - 2 + #runways_list) % #runways_list + 1
+            saveConfig()
+        end
+    end -- Этот end закрывает всю огромную цепочку проверки событий (if event == "timer" -> elseif)
+end -- Самый нижний end, наглухо закрывающий глобальный цикл while running do
+
+-- Очистка экрана при выходе из программы
+clear()
+print("Flight Control System closed.")
